@@ -81,6 +81,11 @@ def get_particles_chart(X, X_svgd=None):
 
     return chart
 
+def upper_tri_indexing(A):
+    m = A.shape[0]
+    r,c = np.triu_indices(m,1)
+    return A[r,c]
+
 # Kernels
 class RBF(nn.Module):
     """
@@ -197,7 +202,7 @@ class Entropy_toy():
         
 
     
-    def SVGD(self,X):
+    def SVGD(self,X, step):
         """
         Compute the Stein Variational Gradient given a set of particles
         Inputs:
@@ -213,6 +218,9 @@ class Entropy_toy():
         self.score_func = score_func.reshape(self.num_particles, self.particles_dim)
         
         self.K_XX, self.K_diff, self.K_grad, self.K_gamma = self.K.forward(X, X)  
+        
+        #Ali:Add histogram of the gradients
+        self.tb_logger.add_histogram('kernel distribution', upper_tri_indexing(self.K_XX),global_step=step, max_bins=20)
 
         self.num_particles =  self.num_particles
         self.phi_term1 = self.K_XX.matmul(score_func) / self.num_particles
@@ -281,7 +289,7 @@ class Entropy_toy():
             X: A set of updated particles
             phi_X: The gradient used to update the particles
         """
-        phi_X, phi_X_entropy = self.SVGD(X) 
+        phi_X, phi_X_entropy = self.SVGD(X, svgd_itr) 
 
         
         if (svgd_itr > int(self.sigma_k_param_loss_step*self.num_svgd_steps)):
@@ -488,7 +496,7 @@ assert sigma_k_param["loss"] in {"SI", "Entr", "SI_sq", "Entr_sq", "IFT", "SI+En
 
 # project name and logger 
 Project_name = "SVGD_sig_"+str(int(np.sqrt(kernel_sigma)))
-Project_name += "_SVGD_lr "+str(lr)
+Project_name += "_SVGD_lr"+str(lr)
 Project_name += "_num_particles_" +str(num_particles)
 Project_name += "_num_steps_"+str(num_steps)
 Project_name += "_loss_"+sigma_k_param["loss"]+"_step_"+str(sigma_k_param["loss_step"])+"_lr_"+str(sigma_k_param["k_lr"])
