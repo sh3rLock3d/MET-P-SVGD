@@ -4,6 +4,7 @@ from torch import autograd
 import altair as alt
 import matplotlib.pyplot as plt
 import pandas as pd
+from datetime import datetime
 from tqdm import tqdm
 import pickle
 import random
@@ -81,11 +82,6 @@ def get_particles_chart(X, X_svgd=None):
 
     return chart
 
-def upper_tri_indexing(A):
-    m = A.shape[0]
-    r,c = np.triu_indices(m,1)
-    return A[r,c]
-
 # Kernels
 class RBF(nn.Module):
     """
@@ -94,10 +90,17 @@ class RBF(nn.Module):
         sigma: Kernel standard deviatino 
         num_particles: number of particles
     """
-    def __init__(self, sigma, num_particles):
+    def __init__(self, sigma, num_particles, num_steps, train_1_sigma):
         super().__init__()
-        self.sigma =  nn.Parameter(torch.tensor(sigma)) #new
+        if train_1_sigma: 
+            self.sigma =  nn.Parameter(torch.tensor(sigma)) #new
+        else:
+            self.sigma = nn.Parameter(sigma * torch.ones(num_steps))
+            self.mask = torch.zeros(num_steps)
+            self.mask[0] = 1
+        
         self.num_particles = num_particles
+        self.train_1_sigma = train_1_sigma
 
     def forward(self, input_1, input_2):
         """
@@ -111,13 +114,33 @@ class RBF(nn.Module):
             kappa_grad: derivative of rbf kernel
             gamma: 1/2*sigma**2
         """
-        sigma = nn.ReLU()(self.sigma) + 0.1
-
+        #sigma = nn.ReLU()(self.sigma)
+        sigma = 6 * (0.5 * (nn.Tanh()(self.sigma) +1))+0.5 #add 0.5 to make sure particles are interdependant
+        #sigma = 6 * nn.Sigmoid()(self.sigma)
+        self.sigma_plot = sigma #torch.sqrt(sigma)
+        
+        sigma = sigma*sigma
+        
+        
+        if (self.train_1_sigma == False):
+            sigma = (sigma * self.mask).sum()
+            self.mask = torch.roll(self.mask, 1, 0)
+        
+        
         assert input_2.size()[-2:] == input_1.size()[-2:]
         
         diff = input_1.unsqueeze(-2) - input_2.unsqueeze(-3)
         dist_sq = diff.pow(2).sum(-1)
         dist_sq = dist_sq.unsqueeze(-1)
+        
+        ###############median
+        '''
+        median_sq = torch.median(dist_sq.detach().reshape(-1, self.num_particles*self.num_particles), dim=1)[0]
+        median_sq = median_sq.unsqueeze(1).unsqueeze(1)
+        h = median_sq / (2 * np.log(self.num_particles + 1.))
+        sigma = torch.sqrt(h).squeeze()
+        '''
+        ###############  
         
         gamma = 1.0 / (1e-8 + 2 * sigma) 
         
@@ -198,11 +221,12 @@ class Entropy_toy():
         self.logp_line1 = 0
         self.logp_line2 = 0
         self.logp_line3 = 0
-
+        self.kernel_loss_Entr = torch.tensor(0.0)
+        self.kernel_loss_SI = torch.tensor(0.0)
         
 
     
-    def SVGD(self,X, step):
+    def SVGD(self,X):
         """
         Compute the Stein Variational Gradient given a set of particles
         Inputs:
@@ -218,9 +242,6 @@ class Entropy_toy():
         self.score_func = score_func.reshape(self.num_particles, self.particles_dim)
         
         self.K_XX, self.K_diff, self.K_grad, self.K_gamma = self.K.forward(X, X)  
-        
-        #Ali:Add histogram of the gradients
-        self.tb_logger.add_histogram('kernel distribution', upper_tri_indexing(self.K_XX),global_step=step, max_bins=20)
 
         self.num_particles =  self.num_particles
         self.phi_term1 = self.K_XX.matmul(score_func) / self.num_particles
@@ -230,8 +251,34 @@ class Entropy_toy():
         phi_entropy = (self.K_XX-self.identity_mat2).matmul(score_func) / (self.num_particles-1)
         phi_entropy += (self.K_grad.sum(0) / (self.num_particles-1))
         
+        #phi_entropy = phi
+        
         return phi, phi_entropy
+    
+    
+    def compute_stein_identity(self, X):
+        #phi [200,2]
+        #score [200,2]
+        X = X.requires_grad_(True)    
+        phi, phi_X_entr = self.SVGD(X)
+        
+        phi = phi_X_entr
+        
+        grad_phi =[]
+        for i in range(len(X)):
+            grad_phi_tmp = []
+            for j in range(self.particles_dim):
+                grad_ = autograd.grad(phi[i][j], X, retain_graph=True)[0][i].detach() #safa
+                grad_phi_tmp.append(grad_)
+            grad_phi.append(torch.stack(grad_phi_tmp))
 
+        grad_phi = torch.stack(grad_phi) 
+        SI = phi.unsqueeze(-1).matmul(self.score_func.unsqueeze(-2))
+        SI += grad_phi 
+        SId = SI.mean(0).sum()
+        SD = (torch.stack([SI[i].diag().sum() for i in range(len(SI)) ]).mean())**2
+        return SId, SD
+    
     
     def compute_logprob(self, phi, X, svgd_itr):
         """
@@ -254,26 +301,33 @@ class Entropy_toy():
             grad_phi.append(torch.stack(grad_phi_tmp))
 
         self.grad_phi = torch.stack(grad_phi) 
+        
+        det_mat = torch.det(self.identity_mat + self.optim.lr * self.grad_phi)
+        self.tb_logger.add_scalars('det_Jaccobian ', {'min ': det_mat.min().item(), 'max ':det_mat.max().item(),  'mean ':det_mat.mean().item()   } , svgd_itr)
+        self.tb_logger.add_histogram( 'det_Jaccobian ', det_mat, svgd_itr )
+        
         self.logp_line1 = self.logp_line1 - torch.log(torch.abs(torch.det(self.identity_mat + self.optim.lr * self.grad_phi)))
 
         grad_phi_trace = torch.stack( [torch.trace(grad_phi[i]) for i in range(len(grad_phi))] ) 
         self.logp_line2 = self.logp_line2 - self.optim.lr * grad_phi_trace
         
-        if svgd_itr > int(0.9*self.num_svgd_steps): #new # loss of 10 percent last steps
-            self.kernel_loss_Entr += grad_phi_trace.mean(-1)**2
         '''
         line3_term1 = (self.K_grad * self.score_func.unsqueeze(0)).sum(-1).sum(1)/(self.num_particles-1)
-        line3_term2 = -2 * self.K_gamma * (( self.K_grad.permute(1,0,2) * self.K_diff).sum(-1) - self.particles_dim * (self.K_XX - self.identity_mat2) ).sum(0)/(self.num_particles-1)
+        line3_term2 = -2 * self.K_gamma * (( self.K_grad.permute(1,0,2) * self.K_diff).sum(-1) - self.particles_dim * (self.K_XX - self.identity_mat2) ).sum(0)/(self.num_particles-1)        
         invertability = line3_term1 + line3_term2
+        
         self.logp_line3 = self.logp_line3 - self.optim.lr * (line3_term1 + line3_term2)
         
         
         if (svgd_itr > int(self.sigma_k_param_loss_step*self.num_svgd_steps)): #new # loss of 10 percent last steps
             if (self.sigma_k_param_loss=="Entr"):
                 self.kernel_loss_Entr += (invertability).mean(0)
-            if (self.sigma_k_param_loss=="Entr_sq"):
-                #self.kernel_loss_Entr += (invertability).mean(0)**2
+            elif (self.sigma_k_param_loss=="Entr_sq"):
                 self.kernel_loss_Entr += ((invertability)**2).mean(0)
+            elif (self.sigma_k_param_loss=="Entr_sq_weighted"):
+                self.kernel_loss_Entr += ((svgd_itr/self.num_svgd_steps)*((invertability)**2)).mean(0)
+            elif (self.sigma_k_param_loss=="Entr_l1_weighted"):
+                self.kernel_loss_Entr += ((svgd_itr/self.num_svgd_steps)*(torch.abs(invertability))).mean(0)
         
         #self.tb_logger.add_scalar('loss_entr_step',  (invertability.mean(0))**2, svgd_itr)
         self.tb_logger.add_scalar('loss_entr_step',  invertability.mean(0), svgd_itr)
@@ -289,7 +343,7 @@ class Entropy_toy():
             X: A set of updated particles
             phi_X: The gradient used to update the particles
         """
-        phi_X, phi_X_entropy = self.SVGD(X, svgd_itr) 
+        phi_X, phi_X_entropy = self.SVGD(X) 
 
         
         if (svgd_itr > int(self.sigma_k_param_loss_step*self.num_svgd_steps)):
@@ -311,10 +365,15 @@ class Entropy_toy():
             self.compute_logprob(phi_X_entropy, X, svgd_itr)
         
         # check convergence
-        #print('convergence',torch.norm(X_new-X))
+        p_dist = ((X_new-X)**2).sum(-1)        
+        self.tb_logger.add_histogram( 'convergence ', p_dist, svgd_itr )
+        
         X = X_new#.detach() #safa #new
         
         return X, phi_X 
+
+
+
 
 def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_std, lr, mu_init, sigma_init, sigma_k_param, tb_logger,Project_name,plot):
     """
@@ -347,13 +406,20 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
     #gauss = torch.distributions.uniform.Uniform(torch.tensor([-7.0,-7.0]), torch.tensor([7.0,7.0]))
     #     gauss = GMMDist(dim=dim, n_gmm=n_gmm, sigma=gmm_std)
 
-    experiment = Entropy_toy(gauss, RBF(kernel_sigma, num_particles), Optim(lr), num_particles=num_particles, particles_dim=dim, with_logprob=True, num_svgd_steps=num_svgd_step, tb_logger=tb_logger, sigma_k_param=sigma_k_param) 
+    experiment = Entropy_toy(gauss, RBF(kernel_sigma, num_particles, num_steps, sigma_k_param["train_1_sigma"]), Optim(lr), num_particles=num_particles, particles_dim=dim, with_logprob=True, num_svgd_steps=num_svgd_step, tb_logger=tb_logger, sigma_k_param=sigma_k_param) 
 
     if dim == 2:
         gauss_chart = get_density_chart(gauss, d=7.0, step=0.1) 
         init_chart = gauss_chart + get_particles_chart(X_init.cpu().numpy())
     
-
+    ####verify if kernel is in the Stein Class
+    #sample from target distribution
+    target_samples = gauss.sample((num_particles,))
+    #target_phi_X, target_phi_X_entr = experiment.SVGD(target_samples)
+    #tb_logger.add_histogram( 'Stein Identity/phi ', (target_phi_X**2).sum(-1) , 0 )
+    #tb_logger.add_histogram( 'Stein Identity/phi_entr ', (target_phi_X_entr**2).sum(-1), 0 )
+    SI, SD = experiment.compute_stein_identity(target_samples)
+    
     def run_sampler(alg, X, steps, train_itr):
         """
         Perform SVGD updates
@@ -373,7 +439,7 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
         
         # for t in tqdm(range(steps), desc='svgd_steps'): 
         for t in range(steps): 
-            #print('__________________',t)
+            print('__________________',t)
             #print('X_svgd_ ', X_svgd_)
             X, phi_X = experiment.step(X, alg,  svgd_itr=t)
             if plot:
@@ -386,7 +452,15 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
             # print(t, ' entropy svgd (line 2): ',  -(init_dist.log_prob(X_init) + experiment.logp_line2).mean().item())
             # print(t, ' entropy svgd (line 3): ',  -(init_dist.log_prob(X_init) + experiment.logp_line3).mean().item())
             # print()
-            tb_logger.add_scalar('SVGD_Entr/'+str(int(np.sqrt(experiment.K.sigma.item()))),-(init_dist.log_prob(X_init) + experiment.logp_line3).mean().item(), t)
+            tb_logger.add_scalar('SVGD_Entr',-(init_dist.log_prob(X_init) + experiment.logp_line3).mean().item(), t)
+            
+            if (sigma_k_param["train_1_sigma"]==False):
+                tb_logger.add_scalar('SVGD_Sig_k', experiment.K.sigma[t], t)
+            
+            if (train_itr==0):
+                tb_logger.add_scalar('SVGD_Entr/itr_0',-(init_dist.log_prob(X_init) + experiment.logp_line3).mean().item(), t)
+                
+            #tb_logger.add_scalar('SVGD_Entr/'+str(int(np.sqrt(experiment.K.sigma.item()))),-(init_dist.log_prob(X_init) + experiment.logp_line3).mean().item(), t)
         
         if plot:
             X_svgd_ = torch.stack(X_svgd_)
@@ -399,7 +473,6 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
         experiment.logp_line1 = -(init_dist.log_prob(X_init) + experiment.logp_line1).mean().item()
         experiment.logp_line2 = -(init_dist.log_prob(X_init) + experiment.logp_line2).mean().item()
         experiment.logp_line3 = -(init_dist.log_prob(X_init) + experiment.logp_line3).mean().item()
-
         
         
         #print("t: ",t, ' entropy svgd (line 1): ',  -(init_dist.log_prob(X_init) + experiment.logp_line1).mean().item())
@@ -408,11 +481,13 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
         print('entropy gt (logp): ', gt_entr)  
         print()
         
-        return gt_entr, sampler_entr, charts
+        return gt_entr, sampler_entr, charts, X
 
     # Run SVGD
-    #print('_________SVGD___________')
-    #
+    
+    
+     
+    
 
     ################################ Learn \sigma_kernel ################################
     # TODO: save the loss across steps
@@ -427,18 +502,20 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
     #new
     for itr in range(sigma_k_param["num_epochs"]): 
         k_optimizer.zero_grad()
-        gt_entr, sampler_entr_svgd, charts_svgd = run_sampler('svgd', X_init.clone(), steps=num_svgd_step, train_itr=itr)
-
+        gt_entr, sampler_entr_svgd, charts_svgd, X = run_sampler('svgd', X_init.clone(), steps=num_svgd_step, train_itr=itr)
+        
         #loss_kernel = experiment.kernel_loss_SI + experiment.kernel_loss_Entr
         loss_SI =  experiment.kernel_loss_SI 
         loss_entr = experiment.kernel_loss_Entr
         
-        if sigma_k_param["loss"] == "SI":
+        if sigma_k_param["loss"] in {"SI", "SI_sq"}:
             loss_kernel =  experiment.kernel_loss_SI 
-        elif sigma_k_param["loss"] == "Entr":
+        elif sigma_k_param["loss"] in {"Entr", "Entr_sq", "Entr_l1_weighted", "Entr_sq_weighted"}:
             loss_kernel =  experiment.kernel_loss_Entr
         elif sigma_k_param["loss"] == "SI+Entr":
             loss_kernel =  loss_SI+loss_entr
+        elif sigma_k_param["loss"] == "KLD":
+            loss_kernel = -(experiment.P.log_prob(X).mean() + experiment.logp_line3)
         # add IFT
         
         loss_kernel.backward(retain_graph=True)
@@ -449,14 +526,30 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
         
         if plot:
             (charts_svgd[0]|charts_svgd[20]|charts_svgd[40]|charts_svgd[60]|charts_svgd[80]|charts_svgd[-1]).save('./exp/figs/t'+str(itr)+'_'+Project_name+'.html')
-
+        
         # log the loss
-        tb_logger.add_scalar('kernel_sigma',torch.sqrt(nn.ReLU()(experiment.K.sigma)+ 0.1), itr)
-        tb_logger.add_scalars('Loss',{'total': loss_kernel.item(), 'l_SI':loss_SI.item(), 'l_entr':loss_entr.item()   }, itr)
+        if sigma_k_param["train_1_sigma"]==True:
+            tb_logger.add_scalar('kernel_sigma',experiment.K.sigma_plot, itr)
+        else:
+            for i in range(len(experiment.K.sigma)):
+                tb_logger.add_scalar('kernel_sigma/'+str(i),experiment.K.sigma_plot[i], itr)
+        
+        tb_logger.add_scalar('Loss',loss_kernel.item(), itr)
+        #tb_logger.add_scalars('Loss',{'total': loss_kernel.item(), 'l_SI':loss_SI.item(), 'l_entr':loss_entr.item()   }, itr)
         #tb_logger.add_scalars('Entropy',{'Line1': experiment.logp_line1, 'line2':experiment.logp_line2, 'line3':experiment.logp_line3 }, itr)
         tb_logger.add_scalar('Entropy', experiment.logp_line3, itr)
         
-    
+        # log the gradients
+        for tag, value in experiment.K.named_parameters():
+            if value.grad is not None:
+                if sigma_k_param["train_1_sigma"]:
+                    tb_logger.add_scalar(tag + "/grad", value.grad.cpu(), itr)
+                else:
+                    tb_logger.add_histogram(tag + "/grad", value.grad.cpu(), itr)
+
+
+        #tb_logger.add_graph(loss_kernel, X)
+        
     print('____________________________________________________________')
     return init_chart, sampler_entr_svgd, gt_entr, charts_svgd
 
@@ -466,7 +559,7 @@ if not os.path.exists("./exp"):os.makedirs("./exp")
 if not os.path.exists("./exp/figs"):os.makedirs("./exp/figs") 
 #else: shutil.rmtree("./exp/figs")
 
-if not os.path.exists("./exp/tb_logs"):os.makedirs("./exp/tb_logs")
+if not os.path.exists("./tb_logs"):os.makedirs("./tb_logs")
 #else: shutil.rmtree("./exp/tb_logs")
 
 
@@ -480,31 +573,40 @@ mu_init = 0
 
 # svgd paramters
 lr = 0.5
-num_particles = 200
-num_steps = 300
-kernel_sigma = 1.0**2
+num_particles = 100
+
+num_steps = 400
+kernel_sigma = 2.0#**2
 
 
 # learning of the kernel variance
 sigma_k_param = {}
 sigma_k_param["k_lr"] = 0.01
-sigma_k_param["num_epochs"] = 1000
-sigma_k_param["loss"] = "Entr"
-sigma_k_param["loss_step"] = 0.5 #0, 0.9, 0.5
+sigma_k_param["num_epochs"] = 500
+sigma_k_param["loss"] = "Entr_sq_weighted"
+sigma_k_param["loss_step"] = 0.0 #0, 0.9, 0.5
+sigma_k_param["train_1_sigma"] = True # train a single kernel variance or a kernel variance at every step
 
-assert sigma_k_param["loss"] in {"SI", "Entr", "SI_sq", "Entr_sq", "IFT", "SI+Entr"}
+assert sigma_k_param["loss"] in {"KLD","SI", "Entr", "SI_sq", "Entr_sq", "Entr_sq_weighted", "Entr_l1_weighted", "SI+Entr"}
 
 # project name and logger 
-Project_name = "SVGD_sig_"+str(int(np.sqrt(kernel_sigma)))
-Project_name += "_SVGD_lr"+str(lr)
+Project_name = "tanh_SVGD_sig_"+str(kernel_sigma)
+Project_name += "_train1sigma" + str(int(sigma_k_param["train_1_sigma"]))
+Project_name += "_SVGD_lr "+str(lr)
 Project_name += "_num_particles_" +str(num_particles)
 Project_name += "_num_steps_"+str(num_steps)
 Project_name += "_loss_"+sigma_k_param["loss"]+"_step_"+str(sigma_k_param["loss_step"])+"_lr_"+str(sigma_k_param["k_lr"])
+Project_name += "_"+datetime.now().strftime("%d_%m_%Y__%H_%M_%S")
+tb_logger = SummaryWriter("./tb_logs/"+Project_name)
 
-tb_logger = SummaryWriter("./exp/tb_logs/"+Project_name)
+
 
 # plot
 plot=False
+
+print("*************************************")
+print(Project_name)
+print("*************************************")
 
 init_chart, sampler_entr_svgd, gt_entr, charts_svgd = my_experiment(dim=dim, n_gmm=n_gmm, num_particles=num_particles, num_svgd_step=num_steps, kernel_sigma=kernel_sigma, gmm_std=gmm_std, lr=lr, mu_init=mu_init, sigma_init=sigma_init, sigma_k_param=sigma_k_param, tb_logger=tb_logger,Project_name=Project_name,plot=plot)
 
