@@ -484,13 +484,13 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
 
         # just for debugging remove later 31/1
         if (train_itr == 0):
-            plt.plot(all_logps_diff[:][0])
-            plt.plot(all_logps_diff[:][1])
-            plt.plot(all_logps_diff[:][2])
-            plt.legend(["12", "13", "23"], loc="lower right")
+            plt.plot([all_logps_diff[i][0] for i in range(experiment.num_particles)])
+            plt.plot([all_logps_diff[i][1] for i in range(experiment.num_particles)])
+            plt.plot([all_logps_diff[i][2] for i in range(experiment.num_particles)])
+            plt.legend(["12", "13", "23"])
             plt.savefig("diff.png")
             plt.show()
-            plt.clf()        
+            plt.clf()      
         if plot:
             X_svgd_ = torch.stack(X_svgd_)
         # chart = gauss_chart + get_particles_chart(X.detach().cpu().numpy())
