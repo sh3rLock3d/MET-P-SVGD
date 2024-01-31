@@ -14,6 +14,8 @@ import shutil
 alt.data_transformers.enable('default', max_rows=None)
 from torch.optim import Adam
 import torch.nn as nn
+from torch.autograd.functional import jacobian #31/1
+from torch.autograd.functional import hessian #31/1
 from torch.utils.tensorboard import SummaryWriter
 torch.autograd.set_detect_anomaly(True)
 # Global Variables
@@ -211,8 +213,10 @@ class Entropy_toy():
         self.logp_line3 = 0
 
         # Kernel std loss 
-        self.kernel_loss_Entr = torch.tensor(0.0)
-        self.kernel_loss_SI = torch.tensor(0.0)
+        self.kernel_loss_Entr = torch.tensor(0.0).to(device)
+        self.kernel_loss_SI = torch.tensor(0.0).to(device)
+
+        self.get_log_prob = lambda x : self.P.log_prob(x).sum() #31/1
 
         
     
@@ -221,8 +225,8 @@ class Entropy_toy():
         self.logp_line1 = 0
         self.logp_line2 = 0
         self.logp_line3 = 0
-        self.kernel_loss_Entr = torch.tensor(0.0)
-        self.kernel_loss_SI = torch.tensor(0.0)
+        self.kernel_loss_Entr = torch.tensor(0.0).to(device)
+        self.kernel_loss_SI = torch.tensor(0.0).to(device)
         
 
     
@@ -237,10 +241,16 @@ class Entropy_toy():
             (used to calculate the entropy)
         """
         X = X.requires_grad_(True)
-        log_prob = self.P.log_prob(X)
-        score_func = autograd.grad(log_prob.sum(), X)[0].reshape(self.num_particles, self.particles_dim)
-        self.score_func = score_func.reshape(self.num_particles, self.particles_dim)
         
+        #31/1
+        #log_prob = self.P.log_prob(X)
+        #score_func = autograd.grad(log_prob.sum(), X)[0].reshape(self.num_particles, self.particles_dim)
+        #self.score_func = score_func.reshape(self.num_particles, self.particles_dim)
+        score_func = jacobian(self.get_log_prob, X, create_graph=True)
+        self.score_func = score_func #todo remove score_func
+        self.grad_score_function = hessian(self.get_log_prob, X)     
+        self.grad_score_function = torch.stack([self.grad_score_function[i,:,i,:] for i in range(self.num_particles)])   
+
         self.K_XX, self.K_diff, self.K_grad, self.K_gamma = self.K.forward(X, X)  
 
         self.num_particles =  self.num_particles
@@ -251,7 +261,8 @@ class Entropy_toy():
         phi_entropy = (self.K_XX-self.identity_mat2).matmul(score_func) / (self.num_particles-1)
         phi_entropy += (self.K_grad.sum(0) / (self.num_particles-1))
         
-        #phi_entropy = phi
+        #31/1
+        phi_entropy = phi
         
         return phi, phi_entropy
     
@@ -291,7 +302,7 @@ class Entropy_toy():
             self.logp_line2: log probability using line 2 in the presentation
             self.logp_line3: log probability using line 3 in the presentation
         """
-        '''
+
         grad_phi =[]
         for i in range(len(X)):
             grad_phi_tmp = []
@@ -311,12 +322,14 @@ class Entropy_toy():
         grad_phi_trace = torch.stack( [torch.trace(grad_phi[i]) for i in range(len(grad_phi))] ) 
         self.logp_line2 = self.logp_line2 - self.optim.lr * grad_phi_trace
         
-        '''
+
         line3_term1 = (self.K_grad * self.score_func.unsqueeze(0)).sum(-1).sum(1)/(self.num_particles-1)
-        line3_term2 = -2 * self.K_gamma * (( self.K_grad.permute(1,0,2) * self.K_diff).sum(-1) - self.particles_dim * (self.K_XX - self.identity_mat2) ).sum(0)/(self.num_particles-1)        
-        invertability = line3_term1 + line3_term2
-        
-        self.logp_line3 = self.logp_line3 - self.optim.lr * (line3_term1 + line3_term2)
+        line3_term2 = -2 * self.K_gamma * (( self.K_grad.permute(1,0,2) * self.K_diff).sum(-1) - self.particles_dim * (self.K_XX - self.identity_mat2) ).sum(0)/(self.num_particles)
+        grad_score_func_trace = torch.stack( [torch.trace(self.grad_score_function[i]) for i in range(len(grad_phi))] )  #todo compute it in SVGD
+        line3_term3 = grad_score_func_trace / (self.num_particles) #31/1
+        invertability = line3_term1 + line3_term2 + line3_term3 #31/1
+
+        self.logp_line3 = self.logp_line3 - self.optim.lr * (line3_term1 + line3_term2 + line3_term3) #31/1
         
         
         if (svgd_itr > int(self.sigma_k_param_loss_step*self.num_svgd_steps)): #new # loss of 10 percent last steps
@@ -436,6 +449,7 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
         
         charts = []
         X_svgd_=[]
+        all_logps_diff = []
         
         # for t in tqdm(range(steps), desc='svgd_steps'): 
         for t in range(steps): 
@@ -452,6 +466,12 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
             # print(t, ' entropy svgd (line 2): ',  -(init_dist.log_prob(X_init) + experiment.logp_line2).mean().item())
             # print(t, ' entropy svgd (line 3): ',  -(init_dist.log_prob(X_init) + experiment.logp_line3).mean().item())
             # print()
+            #31/1
+            d12 = torch.abs(experiment.logp_line1 - experiment.logp_line2).mean().item()
+            d13 = torch.abs(experiment.logp_line1 - experiment.logp_line3).mean().item()
+            d23 = torch.abs(experiment.logp_line3 - experiment.logp_line2).mean().item()
+            all_logps_diff.append([d12,d13,d23])
+
             tb_logger.add_scalar('SVGD_Entr',-(init_dist.log_prob(X_init) + experiment.logp_line3).mean().item(), t)
             
             if (sigma_k_param["train_1_sigma"]==False):
@@ -461,7 +481,15 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
                 tb_logger.add_scalar('SVGD_Entr/itr_0',-(init_dist.log_prob(X_init) + experiment.logp_line3).mean().item(), t)
                 
             #tb_logger.add_scalar('SVGD_Entr/'+str(int(np.sqrt(experiment.K.sigma.item()))),-(init_dist.log_prob(X_init) + experiment.logp_line3).mean().item(), t)
-        
+
+        # just for debugging remove later 31/1
+        if (train_itr == 0):
+            plt.plot(all_logps_diff[:][0])
+            plt.plot(all_logps_diff[:][1])
+            plt.plot(all_logps_diff[:][2])
+            plt.legend(["12", "13", "23"], loc="lower right")
+            plt.show()
+            plt.clf()        
         if plot:
             X_svgd_ = torch.stack(X_svgd_)
         # chart = gauss_chart + get_particles_chart(X.detach().cpu().numpy())
@@ -582,9 +610,9 @@ kernel_sigma = 2.0#**2
 # learning of the kernel variance
 sigma_k_param = {}
 sigma_k_param["k_lr"] = 0.01
-sigma_k_param["num_epochs"] = 500
+sigma_k_param["num_epochs"] = 1
 sigma_k_param["loss"] = "Entr_sq_weighted"
-sigma_k_param["loss_step"] = 0.0 #0, 0.9, 0.5
+sigma_k_param["loss_step"] = 0.8 #0, 0.9, 0.5
 sigma_k_param["train_1_sigma"] = True # train a single kernel variance or a kernel variance at every step
 
 assert sigma_k_param["loss"] in {"KLD","SI", "Entr", "SI_sq", "Entr_sq", "Entr_sq_weighted", "Entr_l1_weighted", "SI+Entr"}
