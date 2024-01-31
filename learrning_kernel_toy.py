@@ -488,6 +488,7 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
             plt.plot(all_logps_diff[:][1])
             plt.plot(all_logps_diff[:][2])
             plt.legend(["12", "13", "23"], loc="lower right")
+            plt.savefig("diff.png")
             plt.show()
             plt.clf()        
         if plot:
