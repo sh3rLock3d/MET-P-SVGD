@@ -14,17 +14,15 @@ import shutil
 alt.data_transformers.enable('default', max_rows=None)
 from torch.optim import Adam
 import torch.nn as nn
+from torch.autograd.functional import jacobian #31/1
+from torch.autograd.functional import hessian #31/1
 from torch.utils.tensorboard import SummaryWriter
 torch.autograd.set_detect_anomaly(True)
 # Global Variables
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 device = 'cpu'
 
-
-# Global Variables
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-device = 'cpu'
-
+torch.manual_seed(999)
 
 # Helper Functions
 def get_density_chart(P, d=7.0, step=0.1):
@@ -211,8 +209,10 @@ class Entropy_toy():
         self.logp_line3 = 0
 
         # Kernel std loss 
-        self.kernel_loss_Entr = torch.tensor(0.0)
-        self.kernel_loss_SI = torch.tensor(0.0)
+        self.kernel_loss_Entr = torch.tensor(0.0).to(device)
+        self.kernel_loss_SI = torch.tensor(0.0).to(device)
+
+        self.get_log_prob = lambda x : self.P.log_prob(x).sum() #31/1
 
         
     
@@ -221,8 +221,8 @@ class Entropy_toy():
         self.logp_line1 = 0
         self.logp_line2 = 0
         self.logp_line3 = 0
-        self.kernel_loss_Entr = torch.tensor(0.0)
-        self.kernel_loss_SI = torch.tensor(0.0)
+        self.kernel_loss_Entr = torch.tensor(0.0).to(device)
+        self.kernel_loss_SI = torch.tensor(0.0).to(device)
         
 
     
@@ -237,21 +237,26 @@ class Entropy_toy():
             (used to calculate the entropy)
         """
         X = X.requires_grad_(True)
-        log_prob = self.P.log_prob(X)
-        score_func = autograd.grad(log_prob.sum(), X)[0].reshape(self.num_particles, self.particles_dim)
-        self.score_func = score_func.reshape(self.num_particles, self.particles_dim)
         
+        #31/1
+        #log_prob = self.P.log_prob(X)
+        #score_func = autograd.grad(log_prob.sum(), X, create_graph=True)[0].reshape(self.num_particles, self.particles_dim)
+        #self.score_func = score_func.reshape(self.num_particles, self.particles_dim)
+        self.score_func = jacobian(self.get_log_prob, X,)
+        self.grad_score_func_trace = torch.vmap(torch.trace)(hessian(self.get_log_prob, X)[np.arange(self.num_particles),:,np.arange(self.num_particles),:]) 
+
         self.K_XX, self.K_diff, self.K_grad, self.K_gamma = self.K.forward(X, X)  
 
         self.num_particles =  self.num_particles
-        self.phi_term1 = self.K_XX.matmul(score_func) / self.num_particles
+        self.phi_term1 = self.K_XX.matmul(self.score_func) / self.num_particles
         self.phi_term2 = self.K_grad.sum(0) / self.num_particles
         phi = self.phi_term1 + self.phi_term2
         
-        phi_entropy = (self.K_XX-self.identity_mat2).matmul(score_func) / (self.num_particles-1)
+        phi_entropy = (self.K_XX-self.identity_mat2).matmul(self.score_func) / (self.num_particles-1)
         phi_entropy += (self.K_grad.sum(0) / (self.num_particles-1))
         
-        #phi_entropy = phi
+        #31/1
+        phi_entropy = phi
         
         return phi, phi_entropy
     
@@ -292,6 +297,7 @@ class Entropy_toy():
             self.logp_line3: log probability using line 3 in the presentation
         """
         '''
+        # for calculating line 1 and line 2, note that if you want to calculate line 1 and 2 you should add create_graph=True to jacobian
         grad_phi =[]
         for i in range(len(X)):
             grad_phi_tmp = []
@@ -310,14 +316,13 @@ class Entropy_toy():
 
         grad_phi_trace = torch.stack( [torch.trace(grad_phi[i]) for i in range(len(grad_phi))] ) 
         self.logp_line2 = self.logp_line2 - self.optim.lr * grad_phi_trace
-        
         '''
-        line3_term1 = (self.K_grad * self.score_func.unsqueeze(0)).sum(-1).sum(1)/(self.num_particles-1)
-        line3_term2 = -2 * self.K_gamma * (( self.K_grad.permute(1,0,2) * self.K_diff).sum(-1) - self.particles_dim * (self.K_XX - self.identity_mat2) ).sum(0)/(self.num_particles-1)        
-        invertability = line3_term1 + line3_term2
+        line3_term1 = (self.K_grad * self.score_func.unsqueeze(0)).sum(-1).sum(1)/(self.num_particles)
+        line3_term2 = -2 * self.K_gamma * (( self.K_grad.permute(1,0,2) * self.K_diff).sum(-1) - self.particles_dim * (self.K_XX - self.identity_mat2) ).sum(0)/(self.num_particles)
+        line3_term3 = self.grad_score_func_trace / (self.num_particles) #31/1
+        invertability = line3_term1 + line3_term2 + line3_term3 #31/1
         
-        self.logp_line3 = self.logp_line3 - self.optim.lr * (line3_term1 + line3_term2)
-        
+        self.logp_line3 = self.logp_line3 - self.optim.lr * (line3_term1 + line3_term2 + line3_term3) #31/1 
         
         if (svgd_itr > int(self.sigma_k_param_loss_step*self.num_svgd_steps)): #new # loss of 10 percent last steps
             if (self.sigma_k_param_loss=="Entr"):
@@ -575,16 +580,16 @@ mu_init = 0
 lr = 0.5
 num_particles = 100
 
-num_steps = 400
-kernel_sigma = 2.0#**2
+num_steps = 50
+kernel_sigma = 5.0#**2
 
 
 # learning of the kernel variance
 sigma_k_param = {}
 sigma_k_param["k_lr"] = 0.01
-sigma_k_param["num_epochs"] = 500
+sigma_k_param["num_epochs"] = 1
 sigma_k_param["loss"] = "Entr_sq_weighted"
-sigma_k_param["loss_step"] = 0.0 #0, 0.9, 0.5
+sigma_k_param["loss_step"] = 0.8 #0, 0.9, 0.5
 sigma_k_param["train_1_sigma"] = True # train a single kernel variance or a kernel variance at every step
 
 assert sigma_k_param["loss"] in {"KLD","SI", "Entr", "SI_sq", "Entr_sq", "Entr_sq_weighted", "Entr_l1_weighted", "SI+Entr"}
