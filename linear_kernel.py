@@ -83,91 +83,128 @@ def get_particles_chart(X, X_svgd=None):
     return chart
 
 # Kernels
-class RBF(nn.Module):
+class Kernel1:
     """
     Radial basis funtion kernel (https://en.wikipedia.org/wiki/Radial_basis_function)
     Inputs:
         sigma: Kernel standard deviatino 
         num_particles: number of particles
     """
-    def __init__(self, sigma, num_particles, train_1_sigma=True):
-        '''
-        super().__init__()
-        if train_1_sigma: 
-            self.sigma =  nn.Parameter(torch.tensor(sigma)) #new
-        else:
-            self.sigma = nn.Parameter(sigma * torch.ones(num_steps))
-            self.mask = torch.zeros(num_steps)
-            self.mask[0] = 1
-        '''
+    def __init__(self, num_particles):
         self.num_particles = num_particles
-        self.train_1_sigma = train_1_sigma
+
+    def forward(self, input_1, input_2):
+        
+        kappa = torch.matmul(input_1, input_2.t())
+        grad = input_2        
+        return kappa, grad
+
+
+
+class Kernel2a:
+    def __init__(self, num_particles, dim):
+        self.num_particles = num_particles
+        self.particles_dim = dim
+        self.one_v = torch.ones((num_particles, dim)).to(device)
+        self.norm_func = lambda x: torch.linalg.norm(x, axis = 1)
+        self.kappa_func = lambda x, y: torch.matmul(x*(self.norm_func(x).pow(-1)).unsqueeze(1), (y*(self.norm_func(y).pow(-1)).unsqueeze(1)).t())
+        self.identity = torch.eye(num_particles).to(device)
+        
+
+    def forward(self, input_1, input_2):
+        kappa = (self.kappa_func(input_1, input_2)).to(device) 
+        # 1/||X_i||
+        V = self.norm_func(input_1).pow(-1).to(device)
+        # 1/||X_i||^2
+        V_sq = V.pow(2)
+        
+        # kappa_grad_1 = ((input_1*V.unsqueeze(1)).unsqueeze(1))*(V.view(-1, 1).expand(self.num_particles,self.num_particles).unsqueeze(2))
+        kappa_grad_1 = torch.permute(torch.matmul(V.unsqueeze(0).unsqueeze(-1), torch.permute(input_1*V.unsqueeze(1), (-1,0)).unsqueeze(1)), (-1, -2, 0))
+        kappa_grad_2 = -(kappa * V_sq).unsqueeze(-1)*input_1.unsqueeze(0)
+         
+        kappa_grad = (kappa_grad_1 + kappa_grad_2)
+
+        return kappa, kappa_grad
+    
+#TODO: kernel where factor of normalization is a constant   
+class Kernel2b:
+    def __init__(self, num_particles, dim):
+        self.num_particles = num_particles
+        self.particles_dim = dim
+        self.norm_func = lambda x: torch.linalg.norm(x, axis = 1)
+        self.kappa_func = lambda x, y: torch.matmul(x*(self.norm_func(x).pow(-1)).unsqueeze(1), (y*(self.norm_func(y).pow(-1)).unsqueeze(1)).t())
+        
+    def forward(self, input_1, input_2):
+        kappa = (self.kappa_func(input_1, input_2) + 1).to(device) 
+        V = self.norm_func(input_1).pow(-1).to(device)
+        indices = np.arange(0,self.num_particles)
+        kappa_grad = torch.permute(torch.matmul(V.unsqueeze(0).unsqueeze(-1), torch.permute(input_1*V.unsqueeze(1), (-1,0)).unsqueeze(1)), (-1, -2, 0))
+        kappa_grad[indices, indices] = 0
+        # kappa_grad = ((input_1*V.unsqueeze(1)).unsqueeze(1))*(V.view(-1, 1).expand(self.num_particles,self.num_particles).unsqueeze(2))
+        return kappa, kappa_grad
+
+class RBF:
+    """
+    Radial basis funtion kernel (https://en.wikipedia.org/wiki/Radial_basis_function)
+    Inputs:
+        sigma: Kernel standard deviation
+        num_particles: Number of particles
+    """
+    def __init__(self, sigma, num_particles):
         self.sigma = sigma
+        self.num_particles = num_particles
 
     def forward(self, input_1, input_2):
         """
-        Given two sets of points, return the matrix of distances between each point
+        Given two tensors of particles, return the matrix of distances between each particle
         Inputs:
-            input_1, input_2: a set of points
+            input_1: Particles coordinates
+            input_2: Particles coordinates
         Outputs:
-            kappa: RBF matrix 
-            diff: signed distance 
-            h: kernel variance
-            kappa_grad: derivative of rbf kernel
+            kappa: RBF matrix
+            diff: Signed distance
+            h: Kernel variance
+            kappa_grad: Derivative of rbf kernel
             gamma: 1/2*sigma**2
         """
-        '''
-        #sigma = nn.ReLU()(self.sigma)
-        sigma = 6 * (0.5 * (nn.Tanh()(self.sigma) +1))+0.01 #add 0.5 to make sure particles are interdependant
-        #sigma = 6 * nn.Sigmoid()(self.sigma)
-        self.sigma_plot = sigma #torch.sqrt(sigma)
-        
-        sigma = sigma*sigma
-        
-        
-        if (self.train_1_sigma == False):
-            sigma = (sigma * self.mask).sum()
-            self.mask = torch.roll(self.mask, 1, 0)
-        '''
-        
+        # Check if the inputs have the same size in the last two dimensions
         assert input_2.size()[-2:] == input_1.size()[-2:]
-        
+
+        # Compute the difference between each particle
         diff = input_1.unsqueeze(-2) - input_2.unsqueeze(-3)
+        # Square the difference and sum over the particle's dimensions
         dist_sq = diff.pow(2).sum(-1)
         dist_sq = dist_sq.unsqueeze(-1)
-        
-        ###############median
-        
+
         if self.sigma == "mean":
-            median_sq = torch.mean(dist_sq.detach().reshape(-1, self.num_particles*self.num_particles), dim=1)#[0]
+            # Estimate the kernel variance using the mean of all the particles distances
+            median_sq = torch.mean(dist_sq.detach().reshape(-1, self.num_particles*self.num_particles), dim=1)
             median_sq = median_sq.unsqueeze(1).unsqueeze(1)
             h = median_sq / (2 * np.log(self.num_particles + 1.))
             sigma = torch.sqrt(h)
-            gamma = 1.0 / (1e-8 + 2 * sigma**2) 
-            
         elif self.sigma == "forth":
-            median_sq = 0.5 * torch.mean(dist_sq.detach().reshape(-1, self.num_particles*self.num_particles), dim=1)#[0]
+            # Estimate the kernel variance using the mean devided by two (one forth) of all the particles distances
+            median_sq = 0.5 * torch.mean(dist_sq.detach().reshape(-1, self.num_particles*self.num_particles), dim=1)
             median_sq = median_sq.unsqueeze(1).unsqueeze(1)
             h = median_sq / (2 * np.log(self.num_particles + 1.))
             sigma = torch.sqrt(h)
-            gamma = 1.0 / (1e-8 + 2 * sigma**2) 
-            
         elif self.sigma == "median":
+            # Estimate the kernel variance using the median of all the particles distances
             median_sq = torch.median(dist_sq.detach().reshape(-1, self.num_particles*self.num_particles), dim=1)[0]
             median_sq = median_sq.unsqueeze(1).unsqueeze(1)
             h = median_sq / (2 * np.log(self.num_particles + 1.))
             sigma = torch.sqrt(h)
-            gamma = 1.0 / (1e-8 + 2 * sigma**2) 
-        
         else:
+            # Setting the kernel variance from the input
             sigma = self.sigma
-            gamma = 0.5 / (1e-8 + sigma**2) 
             h = None
-        
-        kappa = (-gamma * dist_sq).exp() 
-        
+
+        gamma = 1.0 / (1e-8 + 2 * sigma**2)
+
+        kappa = (-gamma * dist_sq).exp()
+        # Computing the gradient of the kernel over the particles
         kappa_grad = -2. * (diff * gamma) * kappa
-        return kappa.squeeze(), diff, kappa_grad, gamma
+        return kappa.squeeze(), kappa_grad
 
 
 #Optimizer
@@ -258,7 +295,7 @@ class Entropy_toy():
         self.score_func = jacobian(self.get_log_prob, X, create_graph=True)
         self.grad_score_func_trace = torch.vmap(torch.trace)(hessian(self.get_log_prob, X, create_graph=True)[np.arange(self.num_particles),:,np.arange(self.num_particles),:]) 
 
-        self.K_XX, self.K_diff, self.K_grad, self.K_gamma = self.K.forward(X, X)  
+        self.K_XX, self.K_grad = self.K.forward(X, X)  
 
         self.num_particles =  self.num_particles
         self.phi_term1 = self.K_XX.matmul(self.score_func) / self.num_particles
@@ -268,8 +305,8 @@ class Entropy_toy():
         phi_entropy = (self.K_XX-self.identity_mat2).matmul(self.score_func) / (self.num_particles-1)
         phi_entropy += (self.K_grad.sum(0) / (self.num_particles-1))
         
-        #31/1
-        phi_entropy = phi
+        31/1
+        # phi_entropy = phi
         
         return phi, phi_entropy
     
@@ -295,7 +332,9 @@ class Entropy_toy():
         SI += grad_phi 
         SId = SI.mean(0).sum()
         SD = (torch.stack([SI[i].diag().sum() for i in range(len(SI)) ]).mean())**2
-        return SId, SD
+        #TODO: Visualize KLD, SId, SImax, SImin
+        SImax, SImin = torch.max(SI), torch.min(SI)
+        return SId, SD, SImax, SImin
     
     
     def compute_logprob(self, phi, X, svgd_itr):
@@ -320,23 +359,28 @@ class Entropy_toy():
 
                 self.grad_phi = torch.stack(grad_phi) 
                 
-                det_mat = torch.det(self.identity_mat + self.optim.lr * self.grad_phi)
+                # det_mat = torch.det(self.identity_mat + self.optim.lr * self.grad_phi)
                 #self.tb_logger.add_scalars('det_Jaccobian ', {'min ': det_mat.min().item(), 'max ':det_mat.max().item(),  'mean ':det_mat.mean().item()   } , svgd_itr)
                 #self.tb_logger.add_histogram( 'det_Jaccobian ', det_mat, svgd_itr )
                 
                 self.logp_line1 = self.logp_line1 - torch.log(torch.abs(torch.det(self.identity_mat + self.optim.lr * self.grad_phi)))
 
-                grad_phi_trace = torch.stack( [torch.trace(grad_phi[i]) for i in range(len(grad_phi))] ) 
-                self.logp_line2 = self.logp_line2 - self.optim.lr * grad_phi_trace
-        
-        line3_term1 = (self.K_grad * self.score_func.unsqueeze(0)).sum(-1).sum(1)/(self.num_particles)
-        line3_term2 = -2 * self.K_gamma * (( self.K_grad.permute(1,0,2) * self.K_diff).sum(-1) - self.particles_dim * (self.K_XX - self.identity_mat2) ).sum(0)/(self.num_particles)
+                # grad_phi_trace = torch.stack( [torch.trace(grad_phi[i]) for i in range(len(grad_phi))] ) 
+                # self.logp_line2 = self.logp_line2 - self.optim.lr * grad_phi_trace
+        '''
+        #_________________ we don't want to visualize line 3atm
+        line3_term1 = (2.0*self.K_grad * self.score_func.unsqueeze(0)).sum(-1).squeeze()/(self.num_particles)
+        #line3_term1 = (self.K_grad * self.score_func.unsqueeze(0)).sum(-1).sum(1)/(self.num_particles)
+
+        line3_term2 = 2 * torch.ones(self.num_particles)/(self.num_particles)
+        #line3_term2 = torch.ones(self.num_particles)/(self.num_particles)
+
         line3_term3 = self.grad_score_func_trace / (self.num_particles) #31/1
-        
+
         invertability = line3_term1 + line3_term2 + line3_term3 #31/1
         
         self.logp_line3 = self.logp_line3 - self.optim.lr * (line3_term1 + line3_term2 + line3_term3) #31/1 
-        
+        '''
         '''
         if (svgd_itr > int(self.sigma_k_param_loss_step*self.num_svgd_steps)): #new # loss of 10 percent last steps
             if (self.sigma_k_param_loss=="Entr"):
@@ -349,7 +393,7 @@ class Entropy_toy():
                 self.kernel_loss_Entr += ((svgd_itr/self.num_svgd_steps)*(torch.abs(invertability))).mean(0)
         '''
 
-        self.tb_logger.add_scalar('loss_entr_step',  invertability.mean(0), svgd_itr)
+        
         
         
     def step(self, X, V=None, alg=None, svgd_itr=None):
@@ -385,7 +429,7 @@ class Entropy_toy():
         
         # check convergence
         p_dist = ((X_new-X)**2).sum(-1)        
-        #self.tb_logger.add_histogram( 'convergence ', p_dist, svgd_itr )
+        self.tb_logger.add_histogram( 'convergence ', p_dist, svgd_itr )
         
         X = X_new#.detach() #safa #new
         
@@ -394,7 +438,7 @@ class Entropy_toy():
 
 
 
-def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_std, lr, mu_init, sigma_init, tb_logger,Project_name,plot, calculate_other_lines = False):
+def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_std, lr, mu_init, sigma_init, tb_logger,Project_name,plot, calculate_other_lines = False, kernel='2a'):
     """
     Perform one whole experiment 
     Inputs:
@@ -424,9 +468,10 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
     #gauss = torch.distributions.exponential.Exponential(torch.tensor([5.0,5.0]))
     #gauss = torch.distributions.uniform.Uniform(torch.tensor([-7.0,-7.0]), torch.tensor([7.0,7.0]))
     #     gauss = GMMDist(dim=dim, n_gmm=n_gmm, sigma=gmm_std)
-
-    experiment = Entropy_toy(gauss, RBF(kernel_sigma, num_particles, num_steps), Optim(lr), num_particles=num_particles, particles_dim=dim, with_logprob=True, num_svgd_steps=num_svgd_step, tb_logger=tb_logger, calculate_other_lines = True) 
-
+    if kernel == '2a':
+        experiment = Entropy_toy(gauss, Kernel2a(num_particles, dim), Optim(lr), num_particles=num_particles, particles_dim=dim, with_logprob=True, num_svgd_steps=num_svgd_step, tb_logger=tb_logger, calculate_other_lines = calculate_other_lines) 
+    else:
+        experiment = Entropy_toy(gauss, Kernel2b(num_particles, dim), Optim(lr), num_particles=num_particles, particles_dim=dim, with_logprob=True, num_svgd_steps=num_svgd_step, tb_logger=tb_logger, calculate_other_lines = calculate_other_lines) 
     if dim == 2:
         gauss_chart = get_density_chart(gauss, d=7.0, step=0.1) 
         init_chart = gauss_chart + get_particles_chart(X_init.cpu().numpy())
@@ -437,7 +482,7 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
     #target_phi_X, target_phi_X_entr = experiment.SVGD(target_samples)
     #tb_logger.add_histogram( 'Stein Identity/phi ', (target_phi_X**2).sum(-1) , 0 )
     #tb_logger.add_histogram( 'Stein Identity/phi_entr ', (target_phi_X_entr**2).sum(-1), 0 )
-    SI, SD = experiment.compute_stein_identity(target_samples)
+    SI, SD, SImax, SImin = experiment.compute_stein_identity(target_samples)
     
     def main_loop(alg, X, steps):
         """
@@ -468,17 +513,18 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
                 
             
                 
-            ent3 = -(init_dist.log_prob(X_init) + experiment.logp_line3).mean().item()
-            tb_logger.add_scalars('SVGD_Entr',{'entropy_3':ent3, 'gt_entropy':gt_entr}, t)
+            ent1 = -(init_dist.log_prob(X_init) + experiment.logp_line1).mean().item()
+            tb_logger.add_scalars('SVGD_Entr',{'entropy_1':ent1, 'gt_entropy':gt_entr}, t)
             #______________________ KL divergence
-            KLD = -(experiment.P.log_prob(X).mean() + experiment.logp_line3)
+            KLD = -(experiment.P.log_prob(X).mean() + experiment.logp_line1)
             tb_logger.add_scalar('KL_divergence', KLD.mean(), t)
             
             # ent1 = -(init_dist.log_prob(X_init) + experiment.logp_line1).mean().item()
             # ent2 = -(init_dist.log_prob(X_init) + experiment.logp_line2).mean().item()
             
             # ent.append( [ent1, ent2, ent3])
-            SI, SD = experiment.compute_stein_identity(target_samples)
+            SI, SD, SImax, SImin = experiment.compute_stein_identity(target_samples)
+            tb_logger.add_scalars('stein_parameters',{'Stein_identity':SI, 'SteinMax':SImax, 'SteinMin':SImin},t)
             conv.append(SI.item())
             '''
             if (sigma_k_param["train_1_sigma"]==False):
@@ -486,31 +532,21 @@ def my_experiment(dim, n_gmm, num_particles, num_svgd_step, kernel_sigma, gmm_st
             '''
         if plot:
             X_svgd_ = torch.stack(X_svgd_)
-        # chart = gauss_chart + get_particles_chart(X.detach().cpu().numpy())
+            chart = gauss_chart + get_particles_chart(X.detach().cpu().numpy())
        
         
         
-        sampler_entr =  -(init_dist.log_prob(X_init) + experiment.logp_line3).mean().item()                
+        sampler_entr =  -(init_dist.log_prob(X_init) + experiment.logp_line1).mean().item()                
         
         return gt_entr, sampler_entr, charts, X, ent, conv
 
     gt_entr, sampler_entr_svgd, charts_svgd, X, ent, conv = main_loop('svgd', X_init.clone(), steps=num_svgd_step)
     
-    loss_SI =  experiment.kernel_loss_SI 
-    loss_entr = experiment.kernel_loss_Entr
-    '''
-    if sigma_k_param["loss"] in {"SI", "SI_sq"}:
-        loss_kernel =  experiment.kernel_loss_SI 
-    elif sigma_k_param["loss"] in {"Entr", "Entr_sq", "Entr_l1_weighted", "Entr_sq_weighted"}:
-        loss_kernel =  experiment.kernel_loss_Entr
-    elif sigma_k_param["loss"] == "SI+Entr":
-        loss_kernel =  loss_SI+loss_entr
-    elif sigma_k_param["loss"] == "KLD":
-        loss_kernel = -(experiment.P.log_prob(X).mean() + experiment.logp_line3)
-    # add IFT
-    '''
+    # loss_SI =  experiment.kernel_loss_SI 
+    # loss_entr = experiment.kernel_loss_Entr
+    
     if plot:
-        (charts_svgd[0]|charts_svgd[20]|charts_svgd[40]|charts_svgd[60]|charts_svgd[80]|charts_svgd[-1]).save('./exp/figs/t'+str(itr)+'_'+Project_name+'.html')
+        (charts_svgd[0]|charts_svgd[20]|charts_svgd[40]|charts_svgd[60]|charts_svgd[80]|charts_svgd[-1]).save('./exp/figs/t'+str(kernel)+'_'+Project_name+'.html')
     
     print('____________________________________________________________')
     return init_chart, sampler_entr_svgd, gt_entr, charts_svgd, ent, conv
@@ -535,37 +571,39 @@ sigma_init = 6
 mu_init = 0
 
 # svgd paramters
-lr = 0.5
+lr = 0.07
 num_particles = 100
 
-num_steps = 200
-kernel_sigma = 0.5
+num_steps = 400
+kernel_sigma = 5
 
 # learning of the kernel variance
 sigma_k_param = {}
 calculate_other_lines = True
 
-# project name and logger 
-Project_name = "Sat_NOTRAIN_tanh_SVGD_sig_V1"+str(kernel_sigma)
-Project_name += "_SVGD_lr "+str(lr)
-Project_name += "_num_particles_" +str(num_particles)
-Project_name += "_num_steps_"+str(num_steps)
-Project_name += "_"+datetime.now().strftime("%d_%m_%Y__%H_%M_%S")
-print(Project_name)
-tb_logger = SummaryWriter("./tb_logs/"+Project_name)
+# Testing different kernels
+kernels = ['2a', '2b']
 
-
-
+for kernel in kernels:
+    # project name and logger 
+    Project_name = "Kernel___"+str(kernel)
+    Project_name += "_SVGD_lr "+str(lr)
+    Project_name += "_num_particles_" +str(num_particles)
+    Project_name += "_num_steps_"+str(num_steps)
+    Project_name += "_"+datetime.now().strftime("%d_%m_%Y__%H_%M_%S")
+    print(Project_name)
+    tb_logger = SummaryWriter("./tb_logs/"+Project_name)
 # plot
-plot=False
+    plot=True
 
-print("*************************************")
-print(Project_name)
-print("*************************************")
+    print("*************************************")
+    print(Project_name)
+    print("*************************************")
 
-init_chart, sampler_entr_svgd, gt_entr, charts_svgd, ent, conv = my_experiment(dim=dim, n_gmm=n_gmm, num_particles=num_particles, num_svgd_step=num_steps, kernel_sigma=kernel_sigma, gmm_std=gmm_std, lr=lr, mu_init=mu_init, sigma_init=sigma_init, tb_logger=tb_logger,Project_name=Project_name,plot=plot, calculate_other_lines=calculate_other_lines)
-
-tb_logger.close()
+    init_chart, sampler_entr_svgd, gt_entr, charts_svgd, ent, conv = my_experiment(dim=dim, n_gmm=n_gmm, num_particles=num_particles, num_svgd_step=num_steps, kernel_sigma=kernel_sigma, gmm_std=gmm_std, lr=lr, mu_init=mu_init, sigma_init=sigma_init, tb_logger=tb_logger,Project_name=Project_name,plot=plot, calculate_other_lines=calculate_other_lines, kernel = kernel)
+    with open('/home/local/QCRI/elaabouazza/svgd/MET-P-SVGD/charts__' + str(kernel) + '.pkl','wb') as handler:
+        pickle.dump(charts_svgd, handler)
+    tb_logger.close()
 
 
 '''
